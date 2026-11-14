@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""food-picture-01 entry (round 4): steaming dim sum delivery.
+"""Ship the steaming dim sum photograph for food-picture-01.
 
-The artwork ships inside the repository as ``image.png`` next to this
-file: an editorial close-up of a bamboo steamer of xiao long bao and
-har gow -- translucent pleated wrappers glistening, one soup dumpling
-resting on a ceramic spoon with ginger, steam curling through warm
-light.  Running the program checks the payload against the competition
-limits (PNG or JPEG, at most 1 MiB, at most 1024x1024) and then copies
-it unchanged to ``$MAKEFUN_OUTPUT_DIR/entry.png`` so repeated runs
-produce identical bytes.
+Layout: ``image.png`` sits in this directory holding the finished
+picture of the bamboo steamer.  Running this module performs three
+steps and nothing else:
 
-Standard library only.
+1. locate the output folder named by ``MAKEFUN_OUTPUT_DIR``;
+2. audit the picture against the contest limits -- PNG or JPEG, no
+   more than 1 MiB, no dimension beyond 1024 pixels;
+3. copy the audited bytes to ``entry.png`` in the output folder and
+   read them back to prove the copy is faithful.
+
+The audit reads PNG dimensions from the IHDR chunk and JPEG dimensions
+by stepping through segments to the first start-of-frame marker.  All
+of it is standard library, and the output is a byte-for-byte copy, so
+the result never varies between runs.
 """
-
-from __future__ import annotations
 
 import hashlib
 import os
@@ -21,112 +23,111 @@ import struct
 import sys
 from pathlib import Path
 
-MAX_BYTES = 1_048_576
-MAX_SIDE = 1024
+CEILING_BYTES = 1_048_576
+CEILING_SIDE = 1024
 
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-JPEG_MAGIC = b"\xff\xd8\xff"
+MAGIC_PNG = b"\x89PNG\r\n\x1a\n"
+MAGIC_JPEG = b"\xff\xd8\xff"
 
-# JPEG start-of-frame markers that carry the frame dimensions.
-_JPEG_SOF = frozenset(
-    (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
-)
-
-
-class EntryError(RuntimeError):
-    """Raised when the bundled dim sum image fails validation."""
+# Markers that open a JPEG frame header (baseline through lossless,
+# skipping the differential and arithmetic variants without frames).
+FRAME_OPENERS = frozenset([
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+    0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+])
 
 
-def png_dimensions(data: bytes) -> tuple[int, int]:
-    """Return (width, height) parsed from the PNG IHDR chunk."""
-    if len(data) < 24:
-        raise EntryError("PNG payload too short to contain an IHDR chunk")
-    chunk_len = struct.unpack(">I", data[8:12])[0]
-    chunk_type = data[12:16]
-    if chunk_type != b"IHDR" or chunk_len != 13:
-        raise EntryError("first PNG chunk is not a 13-byte IHDR")
-    width, height = struct.unpack(">II", data[16:24])
-    return width, height
+class AuditFailed(Exception):
+    """The picture broke one of the contest limits."""
 
 
-def jpeg_dimensions(data: bytes) -> tuple[int, int]:
-    """Return (width, height) by walking JPEG segments to a SOF marker."""
-    pos = 2  # skip SOI
-    while pos + 4 <= len(data):
-        if data[pos] != 0xFF:
-            raise EntryError("malformed JPEG: expected 0xFF segment marker")
-        marker = data[pos + 1]
-        if marker in _JPEG_SOF:
-            if pos + 9 > len(data):
-                raise EntryError("truncated JPEG SOF segment")
-            height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
-            return width, height
-        seg_len = struct.unpack(">H", data[pos + 2:pos + 4])[0]
-        if seg_len < 2:
-            raise EntryError("malformed JPEG: bad segment length")
-        pos += 2 + seg_len
-    raise EntryError("no SOF marker found in JPEG payload")
+def iter_jpeg_segments(blob):
+    """Yield (marker, segment_bytes) pairs from a JPEG stream."""
+    index = 2
+    while index + 4 <= len(blob):
+        if blob[index] != 0xFF:
+            raise AuditFailed("JPEG marker expected at offset %d" % index)
+        marker = blob[index + 1]
+        span = struct.unpack(">H", blob[index + 2:index + 4])[0]
+        if span < 2:
+            raise AuditFailed("JPEG segment length %d is invalid" % span)
+        yield marker, blob[index + 4:index + 2 + span]
+        index += 2 + span
 
 
-def validate(payload: bytes) -> tuple[int, int]:
-    """Validate size, magic bytes and dimensions; return (width, height)."""
-    if not payload:
-        raise EntryError("image.png is empty")
-    if len(payload) > MAX_BYTES:
-        raise EntryError(
-            f"image is {len(payload)} bytes, over the {MAX_BYTES}-byte limit"
+def measure(blob):
+    """Return (format, width, height) for an audited payload."""
+    if not blob:
+        raise AuditFailed("image.png contains nothing")
+    if len(blob) > CEILING_BYTES:
+        raise AuditFailed(
+            "payload of %d bytes exceeds the %d-byte ceiling"
+            % (len(blob), CEILING_BYTES)
         )
-    if payload.startswith(PNG_MAGIC):
-        width, height = png_dimensions(payload)
-    elif payload.startswith(JPEG_MAGIC):
-        width, height = jpeg_dimensions(payload)
+    if blob.startswith(MAGIC_PNG):
+        kind = "png"
+        if len(blob) < 24:
+            raise AuditFailed("PNG ends before the IHDR chunk completes")
+        length = struct.unpack(">I", blob[8:12])[0]
+        if blob[12:16] != b"IHDR" or length != 13:
+            raise AuditFailed("first PNG chunk is not a 13-byte IHDR")
+        width, height = struct.unpack(">II", blob[16:24])
+    elif blob.startswith(MAGIC_JPEG):
+        kind = "jpeg"
+        width = height = None
+        for marker, segment in iter_jpeg_segments(blob):
+            if marker in FRAME_OPENERS:
+                if len(segment) < 5:
+                    raise AuditFailed("JPEG frame header is truncated")
+                height, width = struct.unpack(">HH", segment[1:5])
+                break
+        if width is None:
+            raise AuditFailed("JPEG has no start-of-frame segment")
     else:
-        raise EntryError("image.png is neither PNG nor JPEG (bad magic bytes)")
+        raise AuditFailed("payload signature is neither PNG nor JPEG")
     if width < 1 or height < 1:
-        raise EntryError(f"implausible image dimensions {width}x{height}")
-    if width > MAX_SIDE or height > MAX_SIDE:
-        raise EntryError(
-            f"image is {width}x{height}, over the {MAX_SIDE}x{MAX_SIDE} limit"
+        raise AuditFailed("dimensions %dx%d cannot be real" % (width, height))
+    if width > CEILING_SIDE or height > CEILING_SIDE:
+        raise AuditFailed(
+            "dimensions %dx%d exceed the %d-pixel ceiling"
+            % (width, height, CEILING_SIDE)
         )
-    return width, height
+    return kind, width, height
 
 
-def main() -> int:
-    out_dir_raw = os.environ.get("MAKEFUN_OUTPUT_DIR", "").strip()
-    if not out_dir_raw:
+def entrypoint():
+    raw_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "")
+    if not raw_dir.strip():
         print("error: MAKEFUN_OUTPUT_DIR is not set", file=sys.stderr)
         return 2
-    source = Path(__file__).resolve().parent / "image.png"
-    if not source.is_file():
-        print(f"error: bundled image not found at {source}", file=sys.stderr)
+    picture = Path(__file__).resolve().parent / "image.png"
+    if not picture.is_file():
+        print("error: no bundled image at %s" % picture, file=sys.stderr)
         return 2
     try:
-        payload = source.read_bytes()
-        width, height = validate(payload)
-    except (OSError, EntryError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        blob = picture.read_bytes()
+        kind, width, height = measure(blob)
+    except (OSError, AuditFailed) as problem:
+        print("error: %s" % problem, file=sys.stderr)
         return 1
-    out_dir = Path(out_dir_raw)
+    folder = Path(raw_dir)
     try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        dest = out_dir / "entry.png"
-        dest.write_bytes(payload)
-        written = dest.read_bytes()
-    except OSError as exc:
-        print(f"error: could not write output: {exc}", file=sys.stderr)
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "entry.png"
+        target.write_bytes(blob)
+        reread = target.read_bytes()
+    except OSError as problem:
+        print("error: writing the output failed: %s" % problem, file=sys.stderr)
         return 1
-    # Determinism guard: the delivered file must be the validated dim sum
-    # payload, byte for byte, so two runs always yield identical output.
-    if written != payload:
-        print("error: written output differs from the bundled image",
+    if reread != blob:
+        print("error: output copy is not faithful to the picture",
               file=sys.stderr)
         return 1
-    digest = hashlib.sha256(payload).hexdigest()[:16]
-    print(f"wrote {dest} ({len(payload)} bytes, {width}x{height}, "
-          f"sha256:{digest})")
+    stamp = hashlib.sha256(blob).hexdigest()[:16]
+    print("delivered %s (%d bytes, %s, %dx%d, sha256:%s)"
+          % (target, len(blob), kind, width, height, stamp))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(entrypoint())
