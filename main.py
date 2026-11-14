@@ -115,6 +115,10 @@ def entrypoint():
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / "entry.png"
         target.write_bytes(blob)
+        if target.stat().st_size != len(blob):
+            print("error: output copy is not faithful to the picture",
+                  file=sys.stderr)
+            return 1
         reread = target.read_bytes()
     except OSError as problem:
         print("error: writing the output failed: %s" % problem, file=sys.stderr)
